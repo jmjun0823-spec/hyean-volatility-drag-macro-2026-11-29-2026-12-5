@@ -38,7 +38,12 @@ def test_amplitude_and_duration_monotonically_worsen_drag() -> None:
 
 
 def test_panel_hypothesis_event_risk_and_report(tmp_path) -> None:
-    cfg = AnalysisConfig(project_root=tmp_path)
+    # 평시 대조군(2026-11-27, non_event_session)까지 포함해 생성 후 이벤트일(2026-12-04)과 비교
+    cfg = AnalysisConfig(
+        window_start="2026-11-27",
+        window_end="2026-12-05",
+        project_root=tmp_path,
+    )
     panel = load_or_generate_panel(cfg=cfg, use_cache=False, seed=2026)
     res = run_volatility_drag_verification(panel_df=panel, cfg=cfg)
 
@@ -46,7 +51,7 @@ def test_panel_hypothesis_event_risk_and_report(tmp_path) -> None:
     assert res.h0_p_value_3x < 0.01
     assert res.high_vol_drag_worse_3x is True
 
-    # 12월 4일(us_nfp_unemployment) 슬리피지가 평시(baseline)보다 높아야 함
+    # 12월 4일(us_nfp_unemployment) 슬리피지가 평시(2026-11-27 baseline)보다 높아야 함
     nfp_row = res.event_risk_df[res.event_risk_df["date"] == "2026-12-04"].iloc[0]
     base_row = res.event_risk_df[res.event_risk_df["date"] == "2026-11-27"].iloc[0]
     assert nfp_row["est_slippage_bps"] > base_row["est_slippage_bps"]
