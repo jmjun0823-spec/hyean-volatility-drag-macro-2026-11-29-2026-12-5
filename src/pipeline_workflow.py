@@ -10,6 +10,7 @@ from typing import Optional
 import pandas as pd
 
 from config.universe_config import AnalysisConfig, DEFAULT_CONFIG
+from src.chart_builder import generate_all_charts
 from src.data_loader import load_or_generate_panel
 from src.market_data_fetcher import build_override_from_prices, fetch_yfinance_override_panel
 from src.report_builder import build_blog_summary_markdown
@@ -52,7 +53,7 @@ def run_full_workflow(
     1) 패널 데이터 준비(실측 CSV / yfinance / 캐시 또는 폴백 생성)
     2) 변동성 드래그·귀무가설·이벤트 괴리율/슬리피지 검증
     3) R 회귀·가설 교차 검증(.txt 산출)
-    4) 마크다운 리포트(.md) 통합 생성
+    4) 마크다운 리포트(.md) 및 시각화 차트(.png) 생성
     """
     override_df: Optional[pd.DataFrame] = None
     if csv_path:
@@ -98,6 +99,7 @@ def run_full_workflow(
         cfg=cfg,
         r_summary_path=r_summary_file,
     )
+    generate_all_charts(result=result, cfg=cfg)
     return result
 
 
