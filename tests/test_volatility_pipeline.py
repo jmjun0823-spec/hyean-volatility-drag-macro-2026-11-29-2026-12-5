@@ -36,7 +36,7 @@ def test_amplitude_and_duration_monotonically_worsen_drag() -> None:
     assert a2["nav_3x"].is_monotonic_decreasing
 
 
-def test_panel_hypothesis_event_risk_and_report(tmp_path) -> None:
+def test_full_claims_hypothesis_and_report(tmp_path) -> None:
     cfg = AnalysisConfig(
         window_start="2026-11-27",
         window_end="2026-12-05",
@@ -48,14 +48,18 @@ def test_panel_hypothesis_event_risk_and_report(tmp_path) -> None:
     assert res.h0_rejected_3x is True
     assert res.h0_p_value_3x < 0.01
     assert res.high_vol_drag_worse_3x is True
+    assert res.chop_drag_worse_3x is True
+    assert res.vol_slippage_corr > 0.5
+    assert res.imbalance_slippage_corr > 0.1
 
     nfp_row = res.event_risk_df[res.event_risk_df["date"] == "2026-12-04"].iloc[0]
     base_row = res.event_risk_df[res.event_risk_df["date"] == "2026-11-27"].iloc[0]
     assert nfp_row["est_slippage_bps"] > base_row["est_slippage_bps"]
+    assert nfp_row["open_close_slippage_bps"] > nfp_row["est_slippage_bps"]
 
-    md = build_blog_summary_markdown(result=res, cfg=cfg)
+    md = build_blog_summary_markdown(result=res, cfg=cfg, panel_df=panel)
     assert (tmp_path / "outputs" / "blog_verification_summary.md").exists()
-    assert "변동성 드래그" in md
+    assert "Python OLS Cross-Validation Fallback" in md
 
     p1, p2 = generate_all_charts(result=res, cfg=cfg)
     assert p1.exists() and p1.stat().st_size > 0
