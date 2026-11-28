@@ -29,3 +29,16 @@ jobs:
 
       - name: Run end-to-end verification workflow
         run: python -m src.pipeline_workflow --no-cache
+
+      - name: Print generated verification report
+        run: cat outputs/blog_verification_summary.md
+
+      - name: Upload verification artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: volatility-verification-outputs
+          path: |
+            outputs/blog_verification_summary.md
+            outputs/chart_volatility_drag_profile.png
+            outputs/chart_event_slippage_divergence.png
+            data/event_volatility_panel.csv
