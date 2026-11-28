@@ -23,7 +23,6 @@ path_df <- df %>%
     lev2_cum = prod(1 + pmax(2 * underlying_return, -0.9999)) - 1,
     lev3_cum = prod(1 + pmax(3 * underlying_return, -0.9999)) - 1,
     realized_var = var(underlying_return),
-    mean_vol_mult = mean(vol_multiplier),
     max_vol_mult = max(vol_multiplier),
     mean_imbalance = mean(order_imbalance),
     .groups = "drop"
