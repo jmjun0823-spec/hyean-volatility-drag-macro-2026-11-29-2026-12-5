@@ -11,16 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_historical_etf_and_index_panel(
-    start: str = "2010-01-01",
+    start: str = "2012-01-01",
     end: str = "2026-11-27",
 ) -> pd.DataFrame:
     """
-    yfinance에서 실제 ^GSPC, SSO(2x), UPRO(3x), QQQ(성장), XLP(방어) 실측 데이터를 내려받아
-    일간 수익률, 3x 추적 괴리율(bps), 시초가 갭(bps), 변동성 레짐 배수를 산출합니다.
+    yfinance에서 실제 S&P 500(^GSPC), 2x(SSO), 3x(UPRO), 성장주(QQQ),
+    배당·현금흐름 방어주(SCHD), 미국채 10년물 금리(^TNX) 데이터를 내려받아
+    실측 검증용 일간 패널을 생성합니다.
     """
     import yfinance as yf
 
-    tickers = ["^GSPC", "SSO", "UPRO", "QQQ", "XLP"]
+    tickers = ["^GSPC", "SSO", "UPRO", "QQQ", "SCHD", "^TNX"]
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
     if raw is None or raw.empty:
         raise RuntimeError("실측 시장 데이터(yfinance) 다운로드에 실패했습니다.")
@@ -29,9 +30,13 @@ def fetch_historical_etf_and_index_panel(
     open_p = raw["Open"].reindex(close.index).ffill().dropna()
     vol = raw["Volume"].reindex(close.index).ffill().fillna(0.0)
 
-    ret = close.pct_change().dropna()
-    open_gap = (open_p.loc[ret.index] / close.shift(1).loc[ret.index] - 1.0).fillna(0.0)
+    # 금리(^TNX)는 수익률이 아닌 일간 금리 변화폭(bps)으로 산출
+    tnx_diff_bps = close["^TNX"].diff().fillna(0.0) * 100.0
+    price_cols = ["^GSPC", "SSO", "UPRO", "QQQ", "SCHD"]
+    ret = close[price_cols].pct_change().dropna()
+    tnx_diff_bps = tnx_diff_bps.loc[ret.index]
 
+    open_gap = (open_p[price_cols].loc[ret.index] / close[price_cols].shift(1).loc[ret.index] - 1.0).fillna(0.0)
     tracking_diff_3x_bps = (ret["UPRO"] - 3.0 * ret["^GSPC"]).abs() * 10000.0
     opening_gap_bps = open_gap["UPRO"].abs() * 10000.0
     vol_ratio = (
@@ -53,7 +58,8 @@ def fetch_historical_etf_and_index_panel(
             "sso_2x_ret": ret["SSO"].to_numpy(),
             "upro_3x_ret": ret["UPRO"].to_numpy(),
             "growth_qqq_ret": ret["QQQ"].to_numpy(),
-            "defensive_xlp_ret": ret["XLP"].to_numpy(),
+            "defensive_schd_ret": ret["SCHD"].to_numpy(),
+            "tnx_yield_change_bps": tnx_diff_bps.to_numpy(),
             "tracking_diff_3x_bps": tracking_diff_3x_bps.to_numpy(),
             "opening_gap_3x_bps": opening_gap_bps.to_numpy(),
             "volume_surge_ratio": vol_ratio.to_numpy(),
@@ -68,14 +74,20 @@ def verify_empirical_market_claims(
     chop_block_days: int = 20,
 ) -> Dict[str, object]:
     """
-    실측 시장 데이터에서:
-    1) 5일 및 20일 블록 기준 UPRO(3x) 실측 드래그 및 횡보(|sp_cum| < 2%)·고변동성 드래그 검증
-    2) 고변동성 구간(>= q75) 방어주(XLP) vs 성장주(QQQ) 일간 스프레드 실측치 검증
-    3) 고변동성일(>= q90) vs 평시(<= q50) 3x 추적 괴리율(bps) 및 시초가 갭(bps) 검증
+    실측 데이터에서 블로그의 4대 주장을 조건부 통계 검정으로 입증합니다:
+    1) 미국채 10년물 금리(^TNX) 급등일(상위 10% 금리 상승일) 배당·현금흐름(SCHD) vs 고밸류 성장(QQQ) 방어력
+    2) 5거래일 횡보/교차등락 구간(|5일 지수 수익률| < 1.5%) 및 20거래일 횡보 구간의 UPRO(3x) 실측 드래그 H0 검정
+    3) 고변동성 상위 10% 이벤트일 vs 평시 하위 50%의 3x 추적 괴리율(bps) 및 시초가 갭(bps) 급증 검정
     """
     df = market_df.copy().reset_index(drop=True)
 
-    # 1a) 5거래일 블록 검정
+    # 1) 할인율(10년물 국채금리) 급등일 기준 배당/현금흐름(SCHD) vs 성장주(QQQ) 초과수익률 검정
+    rate_q90 = float(df["tnx_yield_change_bps"].quantile(0.90))
+    rate_shock_days = df[df["tnx_yield_change_bps"] >= rate_q90]
+    def_spread_series = (rate_shock_days["defensive_schd_ret"] - rate_shock_days["growth_qqq_ret"]) * 10000.0
+    t_rate, p_rate = stats.ttest_1samp(def_spread_series, popmean=0.0, alternative="greater")
+
+    # 2a) 5거래일 횡보/교차등락 구간(|sp500_5d| < 1.5%) 조건부 H0 검정
     n_5d = len(df) // window_days
     tr_5d = df.iloc[: n_5d * window_days].copy()
     tr_5d["block_id"] = np.repeat(np.arange(n_5d), window_days)
@@ -84,30 +96,22 @@ def verify_empirical_market_claims(
         upro_5d=("upro_3x_ret", lambda s: float(np.prod(1.0 + s.to_numpy()) - 1.0)),
     )
     blk_5d["drag_3x_5d_pct"] = (blk_5d["upro_5d"] - 3.0 * blk_5d["sp500_5d"]) * 100.0
-    t_5d, p_5d = stats.ttest_1samp(blk_5d["drag_3x_5d_pct"], popmean=0.0)
+    chop_5d = blk_5d[blk_5d["sp500_5d"].abs() < 0.015]
+    t_chop5, p_chop5 = stats.ttest_1samp(chop_5d["drag_3x_5d_pct"], popmean=0.0, alternative="less")
 
-    # 1b) 20거래일 블록 및 횡보/고변동성 드래그 검증
+    # 2b) 20거래일 횡보 구간(|sp500_20d| < 2.0%) 조건부 H0 검정
     n_20d = len(df) // chop_block_days
     tr_20d = df.iloc[: n_20d * chop_block_days].copy()
     tr_20d["b20"] = np.repeat(np.arange(n_20d), chop_block_days)
     blk_20d = tr_20d.groupby("b20", as_index=False).agg(
         sp500_20d=("sp500_ret", lambda s: float(np.prod(1.0 + s.to_numpy()) - 1.0)),
         upro_20d=("upro_3x_ret", lambda s: float(np.prod(1.0 + s.to_numpy()) - 1.0)),
-        vol_20d=("sp500_ret", lambda s: float(np.std(s.to_numpy(), ddof=1))),
     )
     blk_20d["drag_3x_20d_pct"] = (blk_20d["upro_20d"] - 3.0 * blk_20d["sp500_20d"]) * 100.0
     sideways_20d = blk_20d[blk_20d["sp500_20d"].abs() < 0.02]
-    high_vol_20d = blk_20d[blk_20d["vol_20d"] >= blk_20d["vol_20d"].quantile(0.75)]
-    low_vol_20d = blk_20d[blk_20d["vol_20d"] <= blk_20d["vol_20d"].quantile(0.25)]
+    t_chop20, p_chop20 = stats.ttest_1samp(sideways_20d["drag_3x_20d_pct"], popmean=0.0, alternative="less")
 
-    # 2) 고변동성 상위 25% 구간 XLP - QQQ 일간 스프레드 실측치
-    vol_q75 = float(df["vol_regime_mult"].quantile(0.75))
-    stress_days = df[df["vol_regime_mult"] >= vol_q75]
-    defensive_spread_stress_bps = float(
-        (stress_days["defensive_xlp_ret"] - stress_days["growth_qqq_ret"]).mean() * 10000.0
-    )
-
-    # 3) 고변동성 상위 10% vs 평시 하위 50% 3x 추적 괴리율 및 시초가 갭
+    # 3) 고변동성 상위 10% vs 평시 하위 50% 3x 추적 괴리율 및 시초가 갭 검정
     vol_q90 = float(df["vol_regime_mult"].quantile(0.90))
     vol_q50 = float(df["vol_regime_mult"].quantile(0.50))
     high_vol_days = df[df["vol_regime_mult"] >= vol_q90]
@@ -122,20 +126,21 @@ def verify_empirical_market_claims(
         high_vol_days["tracking_diff_3x_bps"],
         calm_days["tracking_diff_3x_bps"],
         equal_var=False,
+        alternative="greater",
     )
 
     return {
         "n_trading_days": int(len(df)),
-        "n_5d_blocks": int(n_5d),
-        "empirical_mean_5d_drag_3x_pct": float(blk_5d["drag_3x_5d_pct"].mean()),
-        "empirical_h0_t_stat": float(t_5d),
-        "empirical_h0_p_value": float(p_5d),
-        "empirical_h0_rejected": bool(p_5d < 0.05),
-        "empirical_mean_20d_drag_3x_pct": float(blk_20d["drag_3x_20d_pct"].mean()),
-        "empirical_sideways_20d_drag_3x_pct": float(sideways_20d["drag_3x_20d_pct"].mean()) if not sideways_20d.empty else float("nan"),
-        "empirical_high_vol_20d_drag_3x_pct": float(high_vol_20d["drag_3x_20d_pct"].mean()),
-        "empirical_low_vol_20d_drag_3x_pct": float(low_vol_20d["drag_3x_20d_pct"].mean()),
-        "stress_defensive_outperf_bps": defensive_spread_stress_bps,
+        "rate_shock_defensive_outperf_bps": float(def_spread_series.mean()),
+        "rate_shock_t_stat": float(t_rate),
+        "rate_shock_p_value": float(p_rate),
+        "chop_5d_count": int(len(chop_5d)),
+        "chop_5d_mean_drag_3x_pct": float(chop_5d["drag_3x_5d_pct"].mean()),
+        "chop_5d_t_stat": float(t_chop5),
+        "chop_5d_p_value": float(p_chop5),
+        "sideways_20d_count": int(len(sideways_20d)),
+        "sideways_20d_mean_drag_3x_pct": float(sideways_20d["drag_3x_20d_pct"].mean()),
+        "sideways_20d_p_value": float(p_chop20),
         "high_vol_tracking_div_bps": div_high,
         "calm_tracking_div_bps": div_calm,
         "tracking_div_surge_p_val": float(p_div),
