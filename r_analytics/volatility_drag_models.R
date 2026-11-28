@@ -14,30 +14,31 @@ if (!file.exists(input_csv)) {
 }
 
 df <- read_csv(input_csv, show_col_types = FALSE) %>%
-  arrange(path_id, date) %>%
+  arrange(path_id, date)
+
+path_df <- df %>%
   group_by(path_id) %>%
-  mutate(
-    lev2_ret = pmax(2 * underlying_return, -0.9999),
-    lev3_ret = pmax(3 * underlying_return, -0.9999),
-    base_cum = cumprod(1 + underlying_return) - 1,
-    lev2_cum = cumprod(1 + lev2_ret) - 1,
-    lev3_cum = cumprod(1 + lev3_ret) - 1,
-    drag_3x  = (1 + lev3_cum) - (1 + 3 * base_cum),
-    realized_var = var(underlying_return)
+  summarise(
+    base_cum = prod(1 + underlying_return) - 1,
+    lev2_cum = prod(1 + pmax(2 * underlying_return, -0.9999)) - 1,
+    lev3_cum = prod(1 + pmax(3 * underlying_return, -0.9999)) - 1,
+    realized_var = var(underlying_return),
+    mean_vol_mult = mean(vol_multiplier),
+    max_vol_mult = max(vol_multiplier),
+    mean_imbalance = mean(order_imbalance),
+    .groups = "drop"
   ) %>%
-  ungroup()
+  mutate(
+    drag_3x = (1 + lev3_cum) - (1 + 3 * base_cum),
+    h0_diff_3x = lev3_cum - 3 * base_cum
+  )
 
-final_df <- df %>%
-  group_by(path_id) %>%
-  slice_tail(n = 1) %>%
-  ungroup()
-
-h0_test <- t.test(final_df$lev3_cum - 3 * final_df$base_cum, mu = 0)
-ols_fit <- lm(drag_3x ~ realized_var + vol_multiplier, data = final_df)
+h0_test <- t.test(path_df$h0_diff_3x, mu = 0)
+ols_fit <- lm(drag_3x ~ realized_var + max_vol_mult + mean_imbalance, data = path_df)
 
 sink(out_txt)
-cat("=== R Cross-Validation: Volatility Drag & Event Regime ===\n")
+cat("=== R Cross-Validation: Volatility Drag & Path Regimes ===\n")
 cat(sprintf("Paths: %d | Mean 3x H0 diff: %.6f | t-stat: %.4f | p-value: %.3e\n\n",
-            nrow(final_df), h0_test$estimate, h0_test$statistic, h0_test$p.value))
+            nrow(path_df), h0_test$estimate, h0_test$statistic, h0_test$p.value))
 print(summary(ols_fit))
 sink()
