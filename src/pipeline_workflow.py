@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def _run_r_cross_validation(csv_path: Path, out_txt: Path, r_script: Path) -> Optional[Path]:
-    """Rscript가 설치되어 있고 스크립트가 존재할 때만 R 교차 검증을 수행합니다."""
+    """Rscript가 설치되어 있고 스크립트가 존재할 때 R 교차 검증을 수행합니다."""
     rscript_bin = shutil.which("Rscript")
     if not rscript_bin or not r_script.exists():
-        logger.info("Rscript 또는 R 스크립트가 없어 Python 단독 검증 모드로 진행합니다.")
+        logger.info("Rscript 또는 R 스크립트가 없어 Python 회귀 교차 검증 요약을 사용합니다.")
         return None
 
     completed = subprocess.run(
@@ -48,13 +48,7 @@ def run_full_workflow(
     csv_path: Optional[str] = None,
     price_col: str = "Close",
 ) -> VolatilityDragResult:
-    """
-    전체 검증 워크플로우:
-    1) 패널 데이터 준비(실측 CSV / yfinance / 캐시 또는 폴백 생성)
-    2) 변동성 드래그·귀무가설·이벤트 괴리율/슬리피지 검증
-    3) R 회귀·가설 교차 검증(.txt 산출)
-    4) 마크다운 리포트(.md) 및 시각화 차트(.png) 생성
-    """
+    """전체 검증 워크플로우(데이터 준비 -> 가설·리스크 검증 -> R/Python 교차 검증 -> 리포트·차트 생성)."""
     override_df: Optional[pd.DataFrame] = None
     if csv_path:
         raw_df = pd.read_csv(Path(csv_path), index_col=0, parse_dates=True)
@@ -98,6 +92,7 @@ def run_full_workflow(
         result=result,
         cfg=cfg,
         r_summary_path=r_summary_file,
+        panel_df=panel_df,
     )
     generate_all_charts(result=result, cfg=cfg)
     return result
@@ -106,9 +101,9 @@ def run_full_workflow(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(description="변동성 드래그 및 매크로 이벤트 전체 워크플로우 실행")
-    parser.add_argument("--no-cache", action="store_true", help="캐시를 무시하고 새로 생성")
+    parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--ticker", type=str, default=None, help="실측 조회 티커 (예: ^GSPC, ^KS11)")
+    parser.add_argument("--ticker", type=str, default=None)
     parser.add_argument("--start", type=str, default=None)
     parser.add_argument("--end", type=str, default=None)
     parser.add_argument("--csv-path", type=str, default=None)
