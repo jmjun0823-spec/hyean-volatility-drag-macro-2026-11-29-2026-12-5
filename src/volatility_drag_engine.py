@@ -16,11 +16,17 @@ class VolatilityDragResult:
     event_risk_df: pd.DataFrame
     exact_example_df: pd.DataFrame
     amplitude_duration_df: pd.DataFrame
+    regime_comparison_df: pd.DataFrame
     h0_t_stat_3x: float
     h0_p_value_3x: float
     h0_wilcoxon_p_3x: float
     h0_rejected_3x: bool
     high_vol_drag_worse_3x: bool
+    chop_drag_worse_3x: bool
+    vol_slippage_corr: float
+    vol_slippage_p_val: float
+    imbalance_slippage_corr: float
+    imbalance_slippage_p_val: float
 
 
 def compute_exact_chop_example(base_nav: float = 100.0) -> pd.DataFrame:
@@ -54,8 +60,8 @@ def compute_exact_chop_example(base_nav: float = 100.0) -> pd.DataFrame:
 
 def compute_amplitude_and_duration_matrix(base_nav: float = 100.0) -> pd.DataFrame:
     """
-    등락폭(amplitude: 1%, 2%, 5%)과 교차등락 기간(pairs: 1쌍=2일, 5쌍=10일, 15쌍=30일)에 따라
-    3x 레버리지의 변동성 드래그가 심화되는지 정량 검증 테이블을 생성합니다.
+    등락폭(1%, 2%, 5%)과 교차등락 기간(2일, 10일, 30일)에 따라
+    3x 레버리지의 변동성 드래그가 단조 심화되는지 검증 테이블을 생성합니다.
     """
     rows: List[Dict[str, object]] = []
     for amp in (0.01, 0.02, 0.05):
@@ -65,7 +71,6 @@ def compute_amplitude_and_duration_matrix(base_nav: float = 100.0) -> pd.DataFra
             r_dn = -3.0 * amp
             nav_3x = base_nav * (((1.0 + r_up) * (1.0 + r_dn)) ** n_pairs)
             cum_ret_3x = nav_3x / base_nav - 1.0
-            # 왕복 쌍 기준 기초지수 누적수익률은 (1+amp)*(1-amp) - 1 = -amp^2
             base_pair_ret = (1.0 + amp) * (1.0 - amp) - 1.0
             base_cum_ret = ((1.0 + base_pair_ret) ** n_pairs) - 1.0
             drag_vs_h0 = (1.0 + cum_ret_3x) - (1.0 + 3.0 * base_cum_ret)
@@ -87,8 +92,11 @@ def run_volatility_drag_verification(
     alpha: float = 0.05,
 ) -> VolatilityDragResult:
     """
-    패널 데이터를 기반으로 레버리지 복리 누적수익률, H0(배수 비례) 검정,
-    실현 변동성 드래그 vs 근사 드래그, 이벤트별 괴리율 및 슬리피지를 검증합니다.
+    패널 데이터를 기반으로:
+    1) 1x/2x/3x 누적수익률 및 H0(배수 비례) t-검정·윌콕슨 검정
+    2) 고변동성·교차등락 레짐별 드래그 및 수급/괴리율/슬리피지 검증
+    3) 변동성·수급 불균형과 슬리피지 간 상관성 검증
+    을 수행합니다.
     """
     df = panel_df.copy().sort_values(["path_id", "date"]).reset_index(drop=True)
 
@@ -98,7 +106,8 @@ def run_volatility_drag_verification(
         .rename("base_cum_return")
     )
     path_var = df.groupby("path_id")["underlying_return"].var(ddof=1).fillna(0.0)
-    path_max_vol = df.groupby("path_id")["vol_multiplier"].max()
+    path_vol_std = df.groupby("path_id")["underlying_return"].std(ddof=1).fillna(0.0)
+    path_regime = df.groupby("path_id")["regime"].first()
 
     summary_rows: List[Dict[str, object]] = []
     drag_3x_series = None
@@ -128,7 +137,6 @@ def run_volatility_drag_verification(
             except ValueError:
                 w_pval_f = 1.0
         else:
-            # 단일 경로 입력 시에도 결정론적 드래그 차이를 수치로 기록
             t_stat = float(np.mean(diff_vs_h0) / 1e-6) if abs(float(np.mean(diff_vs_h0))) > 0 else 0.0
             p_val = 0.0 if abs(float(np.mean(diff_vs_h0))) > 0 else 1.0
             w_pval_f = p_val
@@ -155,23 +163,72 @@ def run_volatility_drag_verification(
 
     summary_df = pd.DataFrame(summary_rows)
 
-    # 고변동성 경로의 3x 드래그가 저변동성 경로보다 더 음(-)인지 검증
-    high_vol_mask = path_max_vol >= path_max_vol.median()
+    # 고변동성 경로 vs 저변동성 경로의 3x 드래그 검증
+    high_vol_mask = path_vol_std >= path_vol_std.median()
     if drag_3x_series is not None and high_vol_mask.any() and (~high_vol_mask).any():
-        high_vol_worse = bool(float(drag_3x_series[high_vol_mask].mean()) < float(drag_3x_series[~high_vol_mask].mean()))
+        high_vol_worse = bool(
+            float(drag_3x_series[high_vol_mask].mean()) < float(drag_3x_series[~high_vol_mask].mean())
+        )
     else:
-        high_vol_worse = bool(float(summary_df.loc[summary_df["leverage"] == "3x", "mean_actual_drag_pct"].iloc[0]) < 0.0)
+        high_vol_worse = bool(
+            float(summary_df.loc[summary_df["leverage"] == "3x", "mean_actual_drag_pct"].iloc[0]) < 0.0
+        )
 
-    # 일별·이벤트별 괴리율(3x) 및 슬리피지(bps: 스프레드 + 변동성 충격 + 수급 불균형 + 종가 리밸런싱)
+    # 일별·이벤트별 괴리율 및 슬리피지(장중/장초반/장마감 리밸런싱 포함)
     df["nav_divergence_3x_pct"] = (
         np.abs(df["lev_3x_nav"] / cfg.base_nav - (1.0 + 3.0 * df["underlying_return"])) * 100.0
     )
+    vol_excess = np.maximum(df["vol_multiplier"] - 1.0, 0.0)
     df["est_slippage_bps"] = (
         df["spread_bps"]
-        + cfg.slippage_vol_factor * np.maximum(df["vol_multiplier"] - 1.0, 0.0)
+        + cfg.slippage_vol_factor * vol_excess
         + cfg.slippage_imbalance_factor * df["order_imbalance"]
-        + cfg.eod_rebalance_bps * np.maximum(df["vol_multiplier"] - 1.0, 0.0)
+        + cfg.eod_rebalance_bps * vol_excess
     )
+    df["open_close_window_slippage_bps"] = df["est_slippage_bps"] * (1.0 + 0.35 * df["order_imbalance"])
+
+    # 레짐별 비교 테이블 (수급/변동성/드래그/슬리피지)
+    path_slip = df.groupby("path_id")["est_slippage_bps"].mean()
+    path_imb = df.groupby("path_id")["order_imbalance"].mean()
+    regime_df = pd.DataFrame(
+        {
+            "regime": path_regime,
+            "base_cum_pct": base_cum * 100.0,
+            "drag_3x_pct": drag_3x_series * 100.0,
+            "avg_imbalance": path_imb,
+            "avg_slippage_bps": path_slip,
+        }
+    )
+    regime_comparison_df = (
+        regime_df.groupby("regime", as_index=False)
+        .agg(
+            path_count=("base_cum_pct", "count"),
+            mean_base_cum_pct=("base_cum_pct", "mean"),
+            mean_drag_3x_pct=("drag_3x_pct", "mean"),
+            mean_imbalance=("avg_imbalance", "mean"),
+            mean_slippage_bps=("avg_slippage_bps", "mean"),
+        )
+    )
+
+    chop_rows = regime_comparison_df[regime_comparison_df["regime"] == "noisy_chop"]
+    event_rows = regime_comparison_df[regime_comparison_df["regime"] == "event_volatility"]
+    if not chop_rows.empty and not event_rows.empty:
+        chop_drag_worse = bool(
+            float(chop_rows["mean_drag_3x_pct"].iloc[0]) < float(event_rows["mean_drag_3x_pct"].iloc[0])
+        )
+    else:
+        chop_drag_worse = high_vol_worse
+
+    # 상관관계 검증
+    if len(df) >= 3 and float(df["vol_multiplier"].std(ddof=1)) > 1e-12:
+        r_vol, p_vol = stats.pearsonr(df["vol_multiplier"], df["est_slippage_bps"])
+    else:
+        r_vol, p_vol = 0.0, 1.0
+
+    if len(df) >= 3 and float(df["order_imbalance"].std(ddof=1)) > 1e-12:
+        r_imb, p_imb = stats.pearsonr(df["order_imbalance"], df["est_slippage_bps"])
+    else:
+        r_imb, p_imb = 0.0, 1.0
 
     event_risk_df = (
         df.groupby(["date", "event_name", "event_category"], as_index=False)
@@ -181,6 +238,7 @@ def run_volatility_drag_verification(
             avg_imbalance=("order_imbalance", "mean"),
             avg_divergence_3x_pct=("nav_divergence_3x_pct", "mean"),
             est_slippage_bps=("est_slippage_bps", "mean"),
+            open_close_slippage_bps=("open_close_window_slippage_bps", "mean"),
             p95_slippage_bps=("est_slippage_bps", lambda s: float(np.percentile(s, 95))),
         )
         .sort_values("date")
@@ -192,9 +250,15 @@ def run_volatility_drag_verification(
         event_risk_df=event_risk_df,
         exact_example_df=compute_exact_chop_example(base_nav=cfg.base_nav),
         amplitude_duration_df=compute_amplitude_and_duration_matrix(base_nav=cfg.base_nav),
+        regime_comparison_df=regime_comparison_df,
         h0_t_stat_3x=t_stat_3x,
         h0_p_value_3x=p_val_3x,
         h0_wilcoxon_p_3x=wilcox_p_3x,
         h0_rejected_3x=bool(p_val_3x < alpha),
         high_vol_drag_worse_3x=high_vol_worse,
+        chop_drag_worse_3x=chop_drag_worse,
+        vol_slippage_corr=float(r_vol),
+        vol_slippage_p_val=float(p_vol),
+        imbalance_slippage_corr=float(r_imb),
+        imbalance_slippage_p_val=float(p_imb),
     )
