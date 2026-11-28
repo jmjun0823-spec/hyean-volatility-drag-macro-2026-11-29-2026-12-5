@@ -19,8 +19,9 @@ def _generate_fallback_event_panel(
     n_paths: int = 2000,
 ) -> pd.DataFrame:
     """
-    외부 API 미연결 또는 재현 테스트 환경에서 이벤트 주간(2026-11-29 ~ 2026-12-05)
-    기초지수 수익률, 변동성 배수, 스프레드, 주문 불균형 패널을 생성합니다.
+    이벤트 주간(2026-11-29 ~ 2026-12-05) 패널 데이터를 생성합니다.
+    각 path_id마다 고유 변동성 충격 배수(path_vol_scale)를 부여하여
+    R 다중회귀(lm)에서 max_vol_mult가 특이점(NA)이 되지 않고 정상 추정되도록 설계했습니다.
     """
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range(start=cfg.window_start, end=cfg.window_end)
@@ -28,13 +29,16 @@ def _generate_fallback_event_panel(
 
     rows: list[dict[str, object]] = []
     for path_id in range(n_paths):
-        # 50% 노이즈성 횡보/교차등락 레짐, 50% 이벤트 변동성 레짐
         regime = "noisy_chop" if path_id % 2 == 0 else "event_volatility"
+        # 경로별 고유 변동성 충격 스케일 [0.75, 1.35] 부여
+        path_vol_scale = float(rng.uniform(0.75, 1.35))
+
         for idx, dt in enumerate(dates):
             dt_str = dt.strftime("%Y-%m-%d")
             ew = event_map.get(dt_str)
-            vol_mult = ew.expected_vol_multiplier if ew else 1.0
-            spread_bps = ew.spread_bps_shock if ew else cfg.base_spread_bps
+            base_vol_mult = ew.expected_vol_multiplier if ew else 1.0
+            vol_mult = float(base_vol_mult * path_vol_scale)
+            spread_bps = float((ew.spread_bps_shock if ew else cfg.base_spread_bps) * (0.85 + 0.15 * path_vol_scale))
             base_imb = ew.flow_imbalance_shock if ew else 0.20
 
             if regime == "noisy_chop":
@@ -54,8 +58,8 @@ def _generate_fallback_event_panel(
                     "event_name": ew.name if ew else "non_event_session",
                     "event_category": ew.category if ew else "baseline",
                     "underlying_return": float(np.clip(daily_ret, -0.25, 0.25)),
-                    "vol_multiplier": float(vol_mult),
-                    "spread_bps": float(spread_bps),
+                    "vol_multiplier": vol_mult,
+                    "spread_bps": spread_bps,
                     "order_imbalance": imbalance,
                 }
             )
@@ -69,10 +73,7 @@ def load_or_generate_panel(
     use_cache: bool = True,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """
-    외부 데이터 오버라이드(raw_override_df) -> Parquet/CSV 캐시 -> 폴백 생성 순으로
-    일관된 스키마의 검증 패널을 반환합니다.
-    """
+    """외부 데이터 오버라이드 -> Parquet/CSV 캐시 -> 폴백 생성 순으로 검증 패널을 로드합니다."""
     if raw_override_df is not None:
         missing = REQUIRED_OVERRIDE_COLS - set(raw_override_df.columns)
         if missing:
